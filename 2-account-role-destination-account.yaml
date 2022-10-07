@@ -1,0 +1,72 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Cross account role allowing source account to replicate container images
+  to this accounts ECR registry
+
+Parameters:
+  SourceAccountID:
+    Description: AWS Account ID of source ECR registry
+    AllowedPattern: "[0-9]*"
+    Type: String
+  SourceRoleName:
+    Description: Source account rolename that replicate ECR images to this account
+    AllowedPattern: "[\\w+=,.@-]+"
+    Type: String
+    Default: ECRReplicationCodeBuildRole-eu-west-1
+    MinLength: 14
+    MaxLength: 64
+  DestinationRoleName:
+    Description: Destination role name allowing Codebuild to replicate container images. Should match first part of the solution
+    AllowedPattern: "[\\w+=,.@-]+"
+    Type: String
+    ConstraintDescription: Must be a valid role name pattern
+    Default: DestinationECRReplicationRole
+    MinLength: 14
+    MaxLength: 64
+
+Resources:
+  DestinationECRReplicationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref DestinationRoleName
+      Description: Permit source account to replicate containers into ECR registry
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS:
+            - !Join
+              - ''
+              - - 'arn:aws:iam::'
+                - !Ref SourceAccountID
+                - :role/
+                - !Ref SourceRoleName
+          Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: ReplicateRepositories
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+              - "ecr:GetRepositoryPolicy"
+              - "ecr:DescribeRepositories"
+              - "ecr:GetAuthorizationToken"
+              - "ecr:CreateRepository"
+              Resource: "*"
+  
+Outputs:
+  DestinationRoleName:
+    Description: Role that allows source registry to replicate containers to this account
+    Value: !Ref DestinationECRReplicationRole
+  DestinationRoleArn:
+    Description: Role that allows source registry to replicate containers to this account
+    Value: !GetAtt DestinationECRReplicationRole.Arn

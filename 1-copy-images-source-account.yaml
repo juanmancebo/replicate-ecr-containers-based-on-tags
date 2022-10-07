@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Replicate ECR container images filtered by tags across accounts'
+
+Parameters:
+  RepoPrefix:
+    Description: Provide the prefix of the ECR repository name to replicate
+    AllowedPattern: "[a-z-/]*"
+    Type: String
+    Default: "core/"
+    ConstraintDescription: Must follow the naming convention rules of container tags
+  CodeBuildRoleName:
+    Description: CodeBuild Role name. In the destination account, this role should be trusted
+    AllowedPattern: "[\\w+=,.@-]+"
+    Type: String
+    Default: ECRReplicationCodeBuildRole
+    ConstraintDescription: Must be a valid role name pattern
+  DestinationRoleName:
+    Description: Destination role name allowing Codebuild to replicate container images
+    AllowedPattern: "[\\w+=,.@-]+"
+    Type: String
+    ConstraintDescription: Must be a valid role name pattern
+    Default: DestinationECRReplicationRole
+    MinLength: 14
+    MaxLength: 64
+  DestinationAccountID:
+    Description: Provide the prefix of the image-tag to replicate
+    AllowedPattern: "[0-9]*"
+    Type: String
+    ConstraintDescription: The AWS Account ID only has digits
+  DestinationRegion:
+    Description: Provide the region of the destination ECR registry
+    AllowedValues:
+    - us-east-1
+    - us-east-2
+    - us-west-1
+    - us-west-2
+    - af-south-1
+    - ap-east-1
+    - ap-south-1
+    - ap-northeast-3
+    - ap-northeast-2
+    - ap-northeast-1
+    - ap-southeast-1
+    - ap-southeast-2
+    - ca-central-1
+    - cn-north-1
+    - cn-northwest-1
+    - eu-central-1
+    - eu-west-1
+    - eu-west-2
+    - eu-west-3
+    - eu-south-1
+    - me-south-1
+    - sa-east-1
+    - us-gov-east-1
+    - us-gov-west-1
+    Type: String
+    Default: "us-east-1"
+    ConstraintDescription: Must be a valid region
+
+Resources:
+  ECRReplicationEventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - events.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: TriggerCodeBuild
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action: 
+              - "codebuild:StartBuild"
+              Resource: !GetAtt ECRReplicationCodeBuildProject.Arn
+  
+  ECRReplicationCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: {"Fn::Join": ["-", [{"Ref": "CodeBuildRoleName"},{"Ref": "AWS::Region"}]]}
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+      - PolicyName: ECRReplicationCodeBuildPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Action:
+              - "codebuild:StartBuild"
+              - "codebuild:StopBuild"
+              - "codebuild:Get*"
+              - "codebuild:List*"
+              - "codebuild:BatchGet*"
+              Resource: "*"
+            - Effect: "Allow"
+              Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+              Resource: "*"
+            - Sid: AssumeCrossAccountArn
+              Effect: "Allow"
+              Resource:
+                !Join
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref DestinationAccountID
+                  - :role/
+                  - !Ref DestinationRoleName
+              Action: sts:AssumeRole
+
+  ECRReplicationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Listen to container images pushed to ECR"
+      EventPattern:
+        source:
+          - "aws.ecr"
+        detail-type:
+          - "ECR Image Action" 
+        detail:
+          action-type:
+            - "PUSH"
+          result:
+            - "SUCCESS"
+          repository-name:
+            - prefix: !Ref RepoPrefix
+      State: "ENABLED"
+      Targets:
+      - Arn: !GetAtt 'ECRReplicationCodeBuildProject.Arn'
+        Id: "trigger-ecr-sync-codebuild-project"
+        RoleArn: !GetAtt 'ECRReplicationEventsRole.Arn'
+        InputTransformer:
+          InputPathsMap:
+            "IMAGE_TAG": "$.detail.image-tag"
+            "REPO_NAME": "$.detail.repository-name"
+          InputTemplate:
+            "{\"environmentVariablesOverride\": [{\"name\": \"IMAGE_TAG\", \"value\":<IMAGE_TAG>},{\"name\": \"REPO_NAME\", \"value\":<REPO_NAME>}]}"
+
+  ECRReplicationCodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn:
+    - ECRReplicationCodeBuildRole
+    Properties:
+      Name: ECRReplicationCodeBuildProject
+      Description: "Replicate container images tagged with a pattern to a destination account and region"
+      Artifacts:
+        Type: "NO_ARTIFACTS"
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:5.0"
+        Type: "LINUX_CONTAINER"
+        EnvironmentVariables:
+          - Name: CROSS_ACCOUNT_ROLE_ARN
+            Type: PLAINTEXT
+            Value: 
+              !Join
+                - ''
+                - - 'arn:aws:iam::'
+                  - !Ref DestinationAccountID
+                  - :role/
+                  - !Ref DestinationRoleName
+          - Name: DESTINATION_ACCOUNT
+            Type: PLAINTEXT
+            Value: !Ref DestinationAccountID
+          - Name: DESTINATION_REGION
+            Type: PLAINTEXT
+            Value: !Ref DestinationRegion
+        PrivilegedMode: true
+      ServiceRole: !GetAtt ECRReplicationCodeBuildRole.Arn
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+      Source:
+        Type: "NO_SOURCE"
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            install:
+              commands:
+                - export CURRENT_ACCOUNT=$(echo ${!CODEBUILD_BUILD_ARN} | cut -d':' -f5)
+                - export CURRENT_ECR_REGISTRY=${!CURRENT_ACCOUNT}.dkr.ecr.${!AWS_REGION}.amazonaws.com
+                - export DESTINATION_ECR_REGISTRY=${!DESTINATION_ACCOUNT}.dkr.ecr.${!DESTINATION_REGION}.amazonaws.com
+            pre_build:
+              on-failure: ABORT
+              commands:
+                - echo "Validating Image Tag ${!IMAGE_TAG}"
+                - |
+                  if ! [[ ${!REPO_NAME} = ${RepoPrefix}* && ${!IMAGE_TAG} =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$ ]]; then
+                    aws codebuild stop-build --id ${!CODEBUILD_BUILD_ID}
+                    sleep 60
+                    exit 1
+                  fi
+                - aws ecr get-login-password --region ${!AWS_REGION} | docker login -u AWS --password-stdin ${!CURRENT_ECR_REGISTRY}
+                - docker pull ${!CURRENT_ECR_REGISTRY}/${!REPO_NAME}:${!IMAGE_TAG}
+            build:
+              commands:
+                - echo "Assume cross-account role"
+                - CREDENTIALS=$(aws sts assume-role --role-arn ${!CROSS_ACCOUNT_ROLE_ARN} --role-session-name Rolesession)
+                - export AWS_DEFAULT_REGION=${!DESTINATON_REGION}
+                - export AWS_ACCESS_KEY_ID=$(echo ${!CREDENTIALS} | jq -r '.Credentials.AccessKeyId')
+                - export AWS_SECRET_ACCESS_KEY=$(echo ${!CREDENTIALS} | jq -r '.Credentials.SecretAccessKey')
+                - export AWS_SESSION_TOKEN=$(echo ${!CREDENTIALS} | jq -r '.Credentials.SessionToken')
+                - echo "Logging into cross-account registry"
+                - aws ecr get-login-password --region ${!DESTINATION_REGION} | docker login -u AWS --password-stdin ${!DESTINATION_ECR_REGISTRY}
+                - echo "Checking if repository ${!REPO_NAME} exists in region ${!DESTINATION_REGION} in the account ${!DESTINATION_ACCOUNT}, else exit with fail"
+                - |
+                  aws ecr describe-repositories --repository-names ${!REPO_NAME} --region ${!DESTINATION_REGION} \
+                  || exit 1
+                - echo "retag image and push to destination"
+                - docker tag ${!CURRENT_ECR_REGISTRY}/${!REPO_NAME}:${!IMAGE_TAG} ${!DESTINATION_ECR_REGISTRY}/${!REPO_NAME}:${!IMAGE_TAG}
+                - docker push ${!DESTINATION_ECR_REGISTRY}/${!REPO_NAME}:${!IMAGE_TAG}
+
+Outputs:
+  SourceRoleName:
+    Description: This is the codebuild role that will replicate images to the destination
+    Value: !Ref ECRReplicationCodeBuildRole
